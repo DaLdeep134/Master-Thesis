@@ -1,0 +1,331 @@
+import json
+from typing import Dict, List
+import pandas as pd
+from pathlib import Path
+import zipfile
+import io
+
+class PBIDocumenter:
+    def __init__(self, pbix_path: str):
+        self.pbix_path = pbix_path
+        print(f"PBIX file path: {self.pbix_path}")
+        print(f"Checking if file exists: {Path(self.pbix_path).exists()}")
+        
+    def _read_file_from_pbix(self, file_path: str) -> str:
+        """Read a file from inside the PBIX archive"""
+        try:
+            with zipfile.ZipFile(self.pbix_path) as z:
+                print(f"\nAvailable files in PBIX:")
+                for name in z.namelist():
+                    print(f"- {name}")
+                    
+                print(f"\nTrying to read: {file_path}")
+                with z.open(file_path) as f:
+                    return f.read().decode('utf-8')
+        except Exception as e:
+            print(f"Error reading {file_path} from PBIX: {str(e)}")
+            return ""
+
+    def get_table_summary(self) -> Dict:
+        """Get summary of tables and their calculations"""
+        table_summary = {}
+        try:
+            # Read Layout json which contains table information
+            layout_content = self._read_file_from_pbix('Report/Layout')
+            if not layout_content:
+                print("No Layout content found")
+                return table_summary
+                
+            layout_data = json.loads(layout_content)
+            
+            # Extract tables from sections
+            for section in layout_data.get('sections', []):
+                for visual in section.get('visualContainers', []):
+                    config = visual.get('config', {})
+                    if 'singleVisual' in config:
+                        query = config['singleVisual'].get('prototypeQuery', {})
+                        for select in query.get('Select', []):
+                            table_name = select.get('Table', '')
+                            column_name = select.get('Column', '')
+                            if table_name and table_name not in table_summary:
+                                table_summary[table_name] = {
+                                    'measures': [],
+                                    'columns': []
+                                }
+                            if column_name:
+                                table_summary[table_name]['columns'].append(column_name)
+                                
+            print(f"\nFound {len(table_summary)} tables")
+            for table, info in table_summary.items():
+                print(f"Table {table}: {len(info['columns'])} columns")
+                
+        except Exception as e:
+            print(f"Error in get_table_summary: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+        return table_summary
+
+    def get_dax_calculations(self) -> Dict:
+        """Get all DAX calculations"""
+        dax_calcs = {}
+        try:
+            # Read DataModelSchema which contains DAX expressions
+            model_content = self._read_file_from_pbix('DataModelSchema')
+            if not model_content:
+                print("No DataModelSchema content found")
+                return dax_calcs
+                
+            model_data = json.loads(model_content)
+            
+            # Extract measures and calculated columns
+            for table in model_data.get('model', {}).get('tables', []):
+                table_name = table.get('name', '')
+                measures = {}
+                calculated_columns = {}
+                
+                # Get measures
+                for measure in table.get('measures', []):
+                    name = measure.get('name', '')
+                    expression = measure.get('expression', '')
+                    if name and expression:
+                        measures[name] = expression
+                
+                # Get calculated columns
+                for column in table.get('columns', []):
+                    if column.get('type') == 'calculated':
+                        name = column.get('name', '')
+                        expression = column.get('expression', '')
+                        if name and expression:
+                            calculated_columns[name] = expression
+                
+                if measures or calculated_columns:
+                    dax_calcs[table_name] = {
+                        'measures': measures,
+                        'calculated_columns': calculated_columns
+                    }
+                    
+            print(f"\nFound DAX calculations in {len(dax_calcs)} tables")
+            
+        except Exception as e:
+            print(f"Error in get_dax_calculations: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+        return dax_calcs
+
+    def get_visuals_info(self) -> List[Dict]:
+        """Get information about pages and visuals"""
+        visuals_info = []
+        try:
+            layout_content = self._read_file_from_pbix('Report/Layout')
+            if not layout_content:
+                return visuals_info
+                
+            layout_data = json.loads(layout_content)
+            
+            for page in layout_data.get('sections', []):
+                page_name = page.get('displayName', '')
+                page_visuals = page.get('visualContainers', [])
+                
+                for visual in page_visuals:
+                    config = visual.get('config', {})
+                    visual_type = config.get('singleVisual', {}).get('visualType', '')
+                    
+                    visual_info = {
+                        'page_name': page_name,
+                        'visual_type': visual_type,
+                        'fields': self._extract_visual_fields(config),
+                        'colors': self._extract_visual_colors(config),
+                        'background_color': config.get('background', {}).get('color', '')
+                    }
+                    visuals_info.append(visual_info)
+                    
+            print(f"\nFound {len(visuals_info)} visuals")
+            
+        except Exception as e:
+            print(f"Error in get_visuals_info: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+        return visuals_info
+
+    def get_filters(self) -> Dict:
+        """Get filter information at different levels"""
+        filters = {
+            'report_level': [],
+            'page_level': {},
+            'visual_level': {}
+        }
+        
+        try:
+            layout_content = self._read_file_from_pbix('Report/Layout')
+            if not layout_content:
+                return filters
+                
+            layout_data = json.loads(layout_content)
+            
+            # Report level filters
+            filters['report_level'] = self._extract_filters(layout_data.get('filters', []))
+            
+            # Page and visual level filters
+            for page in layout_data.get('sections', []):
+                page_name = page.get('displayName', '')
+                filters['page_level'][page_name] = self._extract_filters(page.get('filters', []))
+                
+                filters['visual_level'][page_name] = {}
+                for visual in page.get('visualContainers', []):
+                    visual_title = visual.get('config', {}).get('singleVisual', {}).get('title', 'Unnamed Visual')
+                    filters['visual_level'][page_name][visual_title] = self._extract_filters(
+                        visual.get('filters', [])
+                    )
+                    
+            print(f"\nFound filters: {len(filters['report_level'])} report level, {len(filters['page_level'])} pages with filters")
+            
+        except Exception as e:
+            print(f"Error in get_filters: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+        return filters
+
+    def _extract_visual_fields(self, config: Dict) -> Dict:
+        """Helper method to extract fields used in visuals"""
+        fields = {}
+        if 'singleVisual' in config:
+            prj = config['singleVisual'].get('prototypeQuery', {}).get('Select', [])
+            for item in prj:
+                fields[item.get('Name', '')] = item.get('Property', '')
+        return fields
+
+    def _extract_visual_colors(self, config: Dict) -> Dict:
+        """Helper method to extract colors used in visuals"""
+        colors = {}
+        if 'singleVisual' in config:
+            properties = config['singleVisual'].get('objects', {})
+            if 'dataColors' in properties:
+                colors = properties['dataColors']
+        return colors
+
+    def _extract_filters(self, filters: List) -> List[Dict]:
+        """Helper method to extract filter information"""
+        filter_info = []
+        for filter_item in filters:
+            filter_info.append({
+                'table': filter_item.get('table', ''),
+                'column': filter_item.get('column', ''),
+                'filterType': filter_item.get('filterType', ''),
+                'values': filter_item.get('values', [])
+            })
+        return filter_info
+
+    def generate_documentation(self) -> str:
+        """Generate complete documentation"""
+        doc = []
+        doc.append("# Power BI Dashboard Documentation\n")
+
+        # Tables and Calculations Summary
+        doc.append("## 1. Tables and Calculations Summary")
+        table_summary = self.get_table_summary()
+        for table, info in table_summary.items():
+            doc.append(f"\n### Table: {table}")
+            doc.append("\nColumns:")
+            doc.append("\n".join(f"- {col}" for col in info['columns']))
+            doc.append("\nMeasures:")
+            doc.append("\n".join(f"- {measure}" for measure in info['measures']))
+
+        # DAX Calculations
+        doc.append("\n## 2. DAX Calculations")
+        dax_calcs = self.get_dax_calculations()
+        for table, calcs in dax_calcs.items():
+            doc.append(f"\n### Table: {table}")
+            if calcs['measures']:
+                doc.append("\nMeasures:")
+                for name, expression in calcs['measures'].items():
+                    doc.append(f"\n#### {name}")
+                    doc.append(f"```\n{expression}\n```")
+            if calcs['calculated_columns']:
+                doc.append("\nCalculated Columns:")
+                for name, expression in calcs['calculated_columns'].items():
+                    doc.append(f"\n#### {name}")
+                    doc.append(f"```\n{expression}\n```")
+
+        # Visuals Information
+        doc.append("\n## 3. Pages and Visual Details")
+        visuals_info = self.get_visuals_info()
+        current_page = None
+        for visual in visuals_info:
+            if current_page != visual['page_name']:
+                current_page = visual['page_name']
+                doc.append(f"\n### Page: {current_page}")
+            doc.append(f"\n#### Visual Type: {visual['visual_type']}")
+            doc.append("\nFields:")
+            for field, prop in visual['fields'].items():
+                doc.append(f"- {field}: {prop}")
+            doc.append("\nColors:")
+            for element, color in visual['colors'].items():
+                doc.append(f"- {element}: {color}")
+            doc.append(f"\nBackground Color: {visual['background_color']}")
+
+        # Filters
+        doc.append("\n## 4. Filters")
+        filters = self.get_filters()
+        
+        doc.append("\n### Report Level Filters")
+        for filter_info in filters['report_level']:
+            doc.append(f"- {filter_info['table']}.{filter_info['column']}: {filter_info['values']}")
+
+        doc.append("\n### Page Level Filters")
+        for page, page_filters in filters['page_level'].items():
+            if page_filters:
+                doc.append(f"\n#### {page}")
+                for filter_info in page_filters:
+                    doc.append(f"- {filter_info['table']}.{filter_info['column']}: {filter_info['values']}")
+
+        doc.append("\n### Visual Level Filters")
+        for page, visuals in filters['visual_level'].items():
+            if any(visuals.values()):
+                doc.append(f"\n#### Page: {page}")
+                for visual, visual_filters in visuals.items():
+                    if visual_filters:
+                        doc.append(f"\n##### Visual: {visual}")
+                        for filter_info in visual_filters:
+                            doc.append(f"- {filter_info['table']}.{filter_info['column']}: {filter_info['values']}")
+
+        return "\n".join(doc)
+    
+def main():
+    """Example usage of PBIDocumenter"""
+    # Initialize documenter with PBIX file
+    pbix_path = r"C:\Users\AdenK\OneDrive\Desktop\PBI\MS_Italian_Pension_Fund.pbix"
+    documenter = PBIDocumenter(pbix_path)
+    
+    try:
+        # Generate documentation
+        print("\nGenerating documentation...")
+        documentation = documenter.generate_documentation()
+        
+        # Print debug info
+        print(f"\nDocumentation length: {len(documentation)} characters")
+        if len(documentation) > 0:
+            print("\nFirst 200 characters of documentation:")
+            print(documentation[:200])
+        else:
+            print("WARNING: Documentation is empty!")
+        
+        # Save documentation to markdown file in the current directory
+        output_file = Path().absolute() / "sales_returns_documentation.md"
+        print(f"\nSaving to {output_file}...")
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(documentation)
+            
+        print(f"Documentation generated successfully and saved to {output_file}")
+        
+    except Exception as e:
+        print(f"Error generating documentation: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
